@@ -1,0 +1,83 @@
+-- Settings for consistency and safety
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+SET XACT_ABORT ON;
+
+BEGIN TRY
+    BEGIN TRANSACTION;
+
+    PRINT 'Step 1: Drop existing clustered index (if any)...';
+
+    DECLARE @ClusteredIndexName NVARCHAR(128);
+    SELECT @ClusteredIndexName = i.name
+    FROM sys.indexes i
+    WHERE i.object_id = OBJECT_ID('dbo.RuleTables')
+      AND i.type = 1 -- clustered
+      AND i.is_primary_key = 0;
+
+    IF @ClusteredIndexName IS NOT NULL
+    BEGIN
+        EXEC('DROP INDEX [' + @ClusteredIndexName + '] ON dbo.RuleTables');
+        PRINT 'Dropped clustered index: ' + @ClusteredIndexName;
+    END
+    ELSE
+    BEGIN
+        PRINT 'No existing clustered index found.';
+    END
+
+    PRINT 'Step 2: Build partition function values from RuleTableCategoryId...';
+
+    DECLARE @SplitValues NVARCHAR(MAX);
+    SELECT @SplitValues = STRING_AGG(CAST(RuleTableCategoryId AS VARCHAR), ',')
+    FROM (
+        SELECT DISTINCT RuleTableCategoryId
+        FROM dbo.RuleTables
+        WHERE RuleTableCategoryId IS NOT NULL
+    ) AS DistinctIds;
+
+    IF @SplitValues IS NULL OR LEN(@SplitValues) = 0
+    BEGIN
+        THROW 51000, 'No RuleTableCategoryId values found to partition on.', 1;
+    END
+
+    PRINT 'Step 3: Drop existing partition function and scheme if needed...';
+
+    IF EXISTS (SELECT * FROM sys.partition_schemes WHERE name = 'psRuleTableCategoryId')
+        DROP PARTITION SCHEME psRuleTableCategoryId;
+
+    IF EXISTS (SELECT * FROM sys.partition_functions WHERE name = 'pfRuleTableCategoryId')
+        DROP PARTITION FUNCTION pfRuleTableCategoryId;
+
+    PRINT 'Step 4: Create partition function...';
+
+    DECLARE @CreateFunctionSql NVARCHAR(MAX) =
+        'CREATE PARTITION FUNCTION pfRuleTableCategoryId (INT) ' +
+        'AS RANGE LEFT FOR VALUES (' + @SplitValues + ');';
+
+    EXEC sp_executesql @CreateFunctionSql;
+    PRINT 'Partition function created with values: ' + @SplitValues;
+
+    PRINT 'Step 5: Create partition scheme (all on PRIMARY for now)...';
+
+    CREATE PARTITION SCHEME psRuleTableCategoryId
+    AS PARTITION pfRuleTableCategoryId
+    ALL TO ([PRIMARY]);
+
+    PRINT 'Step 6: Create clustered index on partition scheme...';
+
+    CREATE CLUSTERED INDEX IX_RuleTables_CategoryPartition
+    ON dbo.RuleTables (RuleTableCategoryId)
+    ON psRuleTableCategoryId (RuleTableCategoryId);
+
+    COMMIT TRANSACTION;
+    PRINT '✅ Partitioning successfully applied to RuleTables.';
+
+END TRY
+BEGIN CATCH
+    PRINT '❌ ERROR: ' + ERROR_MESSAGE();
+
+    IF @@TRANCOUNT > 0
+        ROLLBACK TRANSACTION;
+
+    THROW;
+END CATCH;
